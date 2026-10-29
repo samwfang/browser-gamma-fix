@@ -370,7 +370,9 @@ def install_available_update():
     if user32.MessageBoxW(window_handle,
             f"Download and install {release.tag}?\n\nThis may resolve browser compatibility. "
             "Browser Gamma Fix will restart; your browsers can remain open. "
-            "The previous installation will be kept as a backup.", APP_NAME, 0x24) != 6:
+            "The previous installation will be kept as a backup.\n\n"
+            "Warning: this local build adds VS Code, Claude and Discord support. "
+            "Official releases do not include it.", APP_NAME, 0x34) != 6:
         return
     with update_lock:
         if update_busy: return
@@ -422,8 +424,12 @@ def handle_update_events():
 class BrowserGenerations:
     """Cache verified runtime plans across browser update transitions."""
 
-    def __init__(self, browser: Path, *, locator=None, planner=None, clock=None, on_unsupported=None):
+    def __init__(self, browser: Path, *, locator=None, planner=None, clock=None, on_unsupported=None, install_root=None):
         self.browser = browser.resolve()
+        # Electron apps link Chromium into the executable itself. Their "DLL"
+        # generation is that executable, which may move to a new versioned
+        # folder below install_root when the app updates.
+        self.install_root = install_root.resolve() if install_root is not None else None
         self._locator = locator or hot.locate_chrome_dll
         self._planner = planner or hot.make_runtime_plan
         self._clock = clock or time.monotonic
@@ -442,14 +448,19 @@ class BrowserGenerations:
 
     def _validated_identity(self, dll: Path) -> tuple[Path, tuple[str, int, int]]:
         resolved = dll.resolve(strict=True)
-        expected_name = {"msedge.exe": "msedge.dll", "vivaldi.exe": "vivaldi.dll"}.get(self.browser.name.lower(), "chrome.dll")
+        if self.install_root is not None:
+            expected_name = self.browser.name.lower()
+            trusted_root = self.install_root
+        else:
+            expected_name = {"msedge.exe": "msedge.dll", "vivaldi.exe": "vivaldi.dll"}.get(self.browser.name.lower(), "chrome.dll")
+            trusted_root = self.browser.parent.resolve()
         if resolved.name.lower() != expected_name:
             raise hot.PatchError(f"Unexpected browser DLL name: {resolved}")
         try:
-            resolved.relative_to(self.browser.parent.resolve())
+            resolved.relative_to(trusted_root)
         except ValueError as error:
             raise hot.PatchError(
-                f"Refusing browser DLL outside {self.browser.parent}: {resolved}"
+                f"Refusing browser DLL outside {trusted_root}: {resolved}"
             ) from error
         stat = resolved.stat()
         return resolved, (
@@ -832,7 +843,8 @@ def toggle_autostart() -> None:
 def about_content() -> str:
     return (
         "Windows HDR SDR gamma 2.2 runtime fix for Google Chrome, "
-        "Microsoft Edge, Brave and Vivaldi.\n\n"
+        "Microsoft Edge, Brave and Vivaldi, plus the VS Code, Claude and "
+        "Discord desktop apps (local build).\n\n"
         f"Author: {APP_AUTHOR}\n\n"
         "Free and open-source software."
     )
@@ -1077,8 +1089,116 @@ def supported_browser_locations():
     )
 
 
+APP_PACKAGES_KEY = (
+    r"Software\Classes\Local Settings\Software\Microsoft\Windows"
+    r"\CurrentVersion\AppModel\Repository\Packages"
+)
+
+
+def _version_tuple(value: str) -> tuple[int, ...] | None:
+    try:
+        return tuple(int(part) for part in value.split("."))
+    except ValueError:
+        return None
+
+
+def newest_squirrel_executable(root: Path, name: str) -> Path | None:
+    """Return the newest `app-<version>/<name>` of a Squirrel install (Discord)."""
+    versions = []
+    for executable in root.glob(f"app-*/{name}"):
+        version = _version_tuple(executable.parent.name[len("app-"):])
+        if version is not None and executable.is_file():
+            versions.append((version, executable))
+    return max(versions)[1] if versions else None
+
+
+def newest_package_executable(prefix: str, publisher_id: str, relative: str) -> Path | None:
+    """Return an executable inside the newest registered MSIX package.
+
+    WindowsApps cannot be listed by a standard user, but the per-user AppModel
+    repository records each installed package's root folder.
+    """
+    versions = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, APP_PACKAGES_KEY) as packages:
+            index = 0
+            while True:
+                try:
+                    full_name = winreg.EnumKey(packages, index)
+                except OSError:
+                    break
+                index += 1
+                parts = full_name.split("_")
+                if (
+                    len(parts) != 5
+                    or parts[0] != prefix
+                    or parts[2] != "x64"
+                    or parts[4] != publisher_id
+                ):
+                    continue
+                version = _version_tuple(parts[1])
+                if version is None:
+                    continue
+                with winreg.OpenKey(packages, full_name) as package:
+                    root, _value_type = winreg.QueryValueEx(package, "PackageRootFolder")
+                executable = Path(root) / relative
+                if executable.is_file():
+                    versions.append((version, executable))
+    except OSError:
+        return None
+    return max(versions)[1] if versions else None
+
+
+def _required(locate):
+    """Adapt an optional discovery function to the generation locator API."""
+    def locator(_executable: Path, _explicit) -> Path:
+        found = locate()
+        if found is None:
+            raise hot.PatchError("Electron app executable is no longer installed")
+        return found
+    return locator
+
+
+def electron_app_locations():
+    """Electron apps verified with the Electron runtime analyzer.
+
+    Each entry is (name, candidate executables, generation locator, install
+    root). Every candidate must still pass the complete structural analysis.
+    """
+    local_app_data = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+    discord_root = local_app_data / "Discord"
+    discord = newest_squirrel_executable(discord_root, "Discord.exe")
+    claude = newest_package_executable("Claude", "pzs8sxrjxfjjc", r"app\Claude.exe")
+    return (
+        (
+            "VS Code",
+            (
+                local_app_data / "Programs" / "Microsoft VS Code" / "Code.exe",
+                Path(r"C:\Program Files\Microsoft VS Code\Code.exe"),
+            ),
+            # VS Code updates replace Code.exe in place.
+            lambda executable, _explicit: executable,
+            None,
+        ),
+        (
+            "Discord",
+            (discord,) if discord is not None else (),
+            _required(lambda: newest_squirrel_executable(discord_root, "Discord.exe")),
+            discord_root,
+        ),
+        (
+            "Claude",
+            (claude,) if claude is not None else (),
+            _required(lambda: newest_package_executable("Claude", "pzs8sxrjxfjjc", r"app\Claude.exe")),
+            Path(r"C:\Program Files\WindowsApps"),
+        ),
+    )
+
+
 def worker() -> None:
-    browser_locations = supported_browser_locations()
+    browser_locations = [
+        (name, candidates, None, None) for name, candidates in supported_browser_locations()
+    ] + list(electron_app_locations())
     targets = []
     states = {}
     update_restart = UpdateRestartCoordinator()
@@ -1089,7 +1209,7 @@ def worker() -> None:
             return
         set_status(" | ".join(f"{name}: {states[name]}" for name in states))
 
-    for name, candidates in browser_locations:
+    for name, candidates, locator, install_root in browser_locations:
         installed = [candidate.resolve() for candidate in candidates if candidate.is_file()]
         if not installed:
             continue
@@ -1101,9 +1221,17 @@ def worker() -> None:
         browser = installed[0]
         states[name] = "analyzing"
         publish_status()
+        electron = locator is not None
+        if electron and install_root is None:
+            install_root = browser.parent
         try:
-            generations = BrowserGenerations(browser, on_unsupported=unsupported_release_check)
-            dll = hot.locate_chrome_dll(browser, None)
+            generations = BrowserGenerations(
+                browser,
+                locator=locator,
+                install_root=install_root,
+                on_unsupported=unsupported_release_check,
+            )
+            dll = (locator or hot.locate_chrome_dll)(browser, None)
             plan, _added, _changed = generations.activate(dll)
             current = set(hot.running_processes_for_executable(browser))
             completed: set[int] = set()
@@ -1117,6 +1245,7 @@ def worker() -> None:
                 {
                     "name": name,
                     "browser": browser,
+                    "electron": electron,
                     "generations": generations,
                     "completed": completed,
                     "roles": {},
@@ -1208,6 +1337,16 @@ def worker() -> None:
                     else:
                         # Renderer and utility processes intentionally retain
                         # their pristine upstream gamma behavior.
+                        target["completed"].add(pid)
+                        continue
+                    if (
+                        role == "browser"
+                        and target["electron"]
+                        and hot.parent_process_ids().get(pid) in current
+                    ):
+                        # Electron runs Node helpers (ELECTRON_RUN_AS_NODE)
+                        # from the same executable without --type. Only the
+                        # main process is started by something else.
                         target["completed"].add(pid)
                         continue
                     target["roles"][pid] = role

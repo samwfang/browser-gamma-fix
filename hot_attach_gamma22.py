@@ -39,6 +39,7 @@ from runtime_gamma22 import (
     locate_chrome_dll,
     make_runtime_plan,
     normalized_path,
+    parent_process_ids,
     path_from_handle,
     read_memory,
     running_processes_for_executable,

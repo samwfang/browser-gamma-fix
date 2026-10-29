@@ -33,6 +33,7 @@ from gamma22_patcher import (
     SRGB_GAMUT,
     SRGB_TRANSFER_FUNCTION,
     branch,
+    discover_chrome_output_layout,
     discover_chrome_runtime_layout,
     find_all_rvas,
     make_trampoline,
@@ -403,6 +404,24 @@ def running_processes_for_executable(executable: Path) -> list[int]:
     return result
 
 
+def parent_process_ids() -> dict[int, int]:
+    """Return a snapshot of every PID's parent PID."""
+    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snapshot == wintypes.HANDLE(-1).value:
+        raise win_error("CreateToolhelp32Snapshot")
+    result: dict[int, int] = {}
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        more = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while more:
+            result[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+            more = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        close_handle(snapshot)
+    return result
+
+
 def _brave_exe_candidates() -> tuple[Path, ...]:
     """Return known Brave executable locations, including per-user installs."""
     candidates = [
@@ -531,23 +550,45 @@ class RuntimePlan:
     writes: list[MemoryWrite]
 
 
-def discover_edge_runtime_layout(dll: Path) -> dict:
-    """Discover Edge's singleton gamma and ScreenWin usage-loop layout."""
-    sections = read_pe_sections(dll)
+ALIGNED_CONSTANT_STRIDES = (
+    ((len(SRGB_GAMUT) + 7) & ~7, (len(SRGB_TRANSFER_FUNCTION) + 7) & ~7),
+)
+# Electron builds have used both the aligned Edge block (Claude, Discord on
+# Chromium 152) and a packed block (VS Code on Chromium 150).
+ELECTRON_CONSTANT_STRIDES = ALIGNED_CONSTANT_STRIDES + (
+    (len(SRGB_GAMUT), len(SRGB_TRANSFER_FUNCTION)),
+)
+# VS Code (Chromium 150), Claude and Discord (Chromium 152) each have 52.
+ELECTRON_SINGLETON_INITIALIZER_MIN = 40
+ELECTRON_SINGLETON_INITIALIZER_MAX = 80
+
+
+def find_singleton_srgb_layout(
+    dll: Path,
+    sections,
+    name: str,
+    strides,
+    initializer_min: int,
+    initializer_max: int,
+) -> tuple[dict, bytes, int]:
+    """Find strict `kSRGB + sRGB gamut -> singleton` constructors.
+
+    Returns the color layout plus the `.text` bytes and RVA for further
+    analysis by the caller.
+    """
     gamut_rvas = set(find_all_rvas(dll, sections, SRGB_GAMUT))
     srgb_rvas = set(find_all_rvas(dll, sections, SRGB_TRANSFER_FUNCTION))
     gamma_rvas = set(find_all_rvas(dll, sections, GAMMA22_TRANSFER_FUNCTION))
-    gamut_stride = (len(SRGB_GAMUT) + 7) & ~7
-    transfer_stride = (len(SRGB_TRANSFER_FUNCTION) + 7) & ~7
     constant_blocks = [
         (gamut, gamut + gamut_stride, gamut + gamut_stride + transfer_stride)
         for gamut in gamut_rvas
+        for gamut_stride, transfer_stride in strides
         if gamut + gamut_stride in srgb_rvas
         and gamut + gamut_stride + transfer_stride in gamma_rvas
     ]
     if len(constant_blocks) != 1:
         raise PatchError(
-            "Expected one contiguous Edge BT.709/sRGB/gamma22 constant block; "
+            f"Expected one contiguous {name} BT.709/sRGB/gamma22 constant block; "
             f"found {len(constant_blocks)}"
         )
     gamut_rva, srgb_rva, gamma_rva = constant_blocks[0]
@@ -557,7 +598,7 @@ def discover_edge_runtime_layout(dll: Path) -> dict:
             section for section in sections if section[0] == ".text"
         )
     except StopIteration as error:
-        raise PatchError("Edge DLL has no .text section") from error
+        raise PatchError(f"{name} DLL has no .text section") from error
     with dll.open("rb") as stream:
         stream.seek(text_offset)
         text = stream.read(text_size)
@@ -595,11 +636,11 @@ def discover_edge_runtime_layout(dll: Path) -> dict:
         position += 1
     constructor_tuples = {(factory, pointer) for _rva, factory, pointer in constructors}
     if (
-        not EDGE_SINGLETON_INITIALIZER_MIN <= len(constructors) <= EDGE_SINGLETON_INITIALIZER_MAX
+        not initializer_min <= len(constructors) <= initializer_max
         or len(constructor_tuples) != 1
     ):
         raise PatchError(
-            "Unexpected Edge singleton constructors: "
+            f"Unexpected {name} singleton constructors: "
             f"{len(constructors)} initializer(s), {len(constructor_tuples)} factory/pointer tuple(s)"
         )
     singleton_factory_rva, singleton_pointer_rva = constructor_tuples.pop()
@@ -608,7 +649,7 @@ def discover_edge_runtime_layout(dll: Path) -> dict:
     # layout into an apparently valid lower-count layout. Account for every load
     # of this canonical sRGB constant and every store to its singleton.
     if srgb_load_rvas != {rva for rva, _factory, _pointer in constructors}:
-        raise PatchError("Unrecognized Edge sRGB singleton initializer load")
+        raise PatchError(f"Unrecognized {name} sRGB singleton initializer load")
     singleton_store_rvas: set[int] = set()
     position = 0
     while True:
@@ -624,7 +665,30 @@ def discover_edge_runtime_layout(dll: Path) -> dict:
     if singleton_store_rvas != {
         rva + 19 for rva, _factory, _pointer in constructors
     }:
-        raise PatchError("Unrecognized Edge sRGB singleton initializer store")
+        raise PatchError(f"Unrecognized {name} sRGB singleton initializer store")
+
+    color = {
+        "srgb_gamut_rva": gamut_rva,
+        "srgb_transfer_rva": srgb_rva,
+        "gamma22_transfer_rva": gamma_rva,
+        "initializer_rvas": [rva for rva, _factory, _pointer in constructors],
+        "singleton_factory_rva": singleton_factory_rva,
+        "singleton_pointer_rva": singleton_pointer_rva,
+    }
+    return color, text, text_rva
+
+
+def discover_edge_runtime_layout(dll: Path) -> dict:
+    """Discover Edge's singleton gamma and ScreenWin usage-loop layout."""
+    sections = read_pe_sections(dll)
+    color, text, text_rva = find_singleton_srgb_layout(
+        dll,
+        sections,
+        "Edge",
+        ALIGNED_CONSTANT_STRIDES,
+        EDGE_SINGLETON_INITIALIZER_MIN,
+        EDGE_SINGLETON_INITIALIZER_MAX,
+    )
 
     loop_candidates: list[tuple[int, int, int, bytes]] = []
     loop_prefix = b"\x45\x31\xC0\x4C\x8D\x8C\x24"
@@ -696,12 +760,7 @@ def discover_edge_runtime_layout(dll: Path) -> dict:
 
     return {
         "kind": "edge-singleton-usage-table",
-        "srgb_gamut_rva": gamut_rva,
-        "srgb_transfer_rva": srgb_rva,
-        "gamma22_transfer_rva": gamma_rva,
-        "initializer_rvas": [rva for rva, _factory, _pointer in constructors],
-        "singleton_factory_rva": singleton_factory_rva,
-        "singleton_pointer_rva": singleton_pointer_rva,
+        **color,
         "loop_limit_rva": loop_rva,
         "usage_table_rva": usage_table_rva,
         "output_helper_rva": output_helper_rva,
@@ -787,28 +846,58 @@ def make_edge_runtime_plan(dll: Path) -> RuntimePlan:
     return RuntimePlan(dll, sha256(dll), layout, checks, writes)
 
 
-def make_runtime_plan(dll: Path) -> RuntimePlan:
-    if dll.name.lower().startswith("msedge.dll"):
-        return make_edge_runtime_plan(dll)
-    layout = discover_chrome_runtime_layout(dll)
-    sections = read_pe_sections(dll)
-    color_writes: list[MemoryWrite] = []
-    with dll.open("rb") as stream:
-        for index, (first, second) in enumerate(layout["initializer_pairs"], 1):
-            for half, instruction_rva, target_rva in (
-                ("a", first, layout["gamma22_transfer_rva"]),
-                ("b", second, layout["gamma22_transfer_rva"] + 12),
-            ):
-                original = read_at(stream, rva_to_offset(sections, instruction_rva), 7)
-                color_writes.append(
-                    MemoryWrite(
-                        f"sRGB initializer {index}{half}",
-                        instruction_rva,
-                        original,
-                        transfer_load(instruction_rva, target_rva, original),
-                    )
-                )
+def discover_electron_runtime_layout(exe: Path) -> dict:
+    """Discover an Electron app's statically linked Chromium layout.
 
+    Electron links Chromium into the app executable. Verified builds (VS Code
+    on Chromium 150, Claude and Discord on Chromium 152) create sRGB through
+    Edge-style singleton constructors but present output through the Chrome
+    ScreenWin hook, so each half reuses the corresponding strict analyzer.
+    """
+    sections = read_pe_sections(exe)
+    color, text, text_rva = find_singleton_srgb_layout(
+        exe,
+        sections,
+        "Electron",
+        ELECTRON_CONSTANT_STRIDES,
+        ELECTRON_SINGLETON_INITIALIZER_MIN,
+        ELECTRON_SINGLETON_INITIALIZER_MAX,
+    )
+    return {
+        "kind": "electron-singleton-trampoline",
+        **color,
+        **discover_chrome_output_layout(text, text_rva),
+    }
+
+
+def make_electron_runtime_plan(exe: Path) -> RuntimePlan:
+    layout = discover_electron_runtime_layout(exe)
+    sections = read_pe_sections(exe)
+    color_writes: list[MemoryWrite] = []
+    with exe.open("rb") as stream:
+        for index, initializer_rva in enumerate(layout["initializer_rvas"], 1):
+            original = read_at(stream, rva_to_offset(sections, initializer_rva), 7)
+            if original[:3] != b"\x48\x8D\x0D":
+                raise PatchError(
+                    f"Unexpected Electron singleton initializer at RVA 0x{initializer_rva:X}"
+                )
+            color_writes.append(
+                MemoryWrite(
+                    f"sRGB initializer {index}",
+                    initializer_rva,
+                    original,
+                    b"\x48\x8D\x0D" + rel32(initializer_rva, 7, layout["gamma22_transfer_rva"]),
+                )
+            )
+    return RuntimePlan(
+        exe, sha256(exe), layout, *chrome_output_checks_and_writes(layout, color_writes)
+    )
+
+
+def chrome_output_checks_and_writes(
+    layout: dict, color_writes: list[MemoryWrite]
+) -> tuple[list[tuple[str, int, bytes]], list[MemoryWrite]]:
+    """Append the Chrome SDR output trampoline and hook after the color writes."""
     trampoline_recipe = {
         "hdr_output": {
             "cave_rva": hex(layout["cave_rva"]),
@@ -840,7 +929,35 @@ def make_runtime_plan(dll: Path) -> RuntimePlan:
         ("gamma 2.2 transfer", layout["gamma22_transfer_rva"], GAMMA22_TRANSFER_FUNCTION),
         ("ScreenWin output helper", layout["set_output_call_rva"], HDR_OUTPUT_HELPER_BYTES),
     ]
-    return RuntimePlan(dll, sha256(dll), layout, checks, writes)
+    return checks, writes
+
+
+def make_runtime_plan(dll: Path) -> RuntimePlan:
+    if dll.name.lower().startswith("msedge.dll"):
+        return make_edge_runtime_plan(dll)
+    if dll.suffix.lower() == ".exe":
+        return make_electron_runtime_plan(dll)
+    layout = discover_chrome_runtime_layout(dll)
+    sections = read_pe_sections(dll)
+    color_writes: list[MemoryWrite] = []
+    with dll.open("rb") as stream:
+        for index, (first, second) in enumerate(layout["initializer_pairs"], 1):
+            for half, instruction_rva, target_rva in (
+                ("a", first, layout["gamma22_transfer_rva"]),
+                ("b", second, layout["gamma22_transfer_rva"] + 12),
+            ):
+                original = read_at(stream, rva_to_offset(sections, instruction_rva), 7)
+                color_writes.append(
+                    MemoryWrite(
+                        f"sRGB initializer {index}{half}",
+                        instruction_rva,
+                        original,
+                        transfer_load(instruction_rva, target_rva, original),
+                    )
+                )
+    return RuntimePlan(
+        dll, sha256(dll), layout, *chrome_output_checks_and_writes(layout, color_writes)
+    )
 
 
 def patch_loaded_module(
@@ -1187,6 +1304,12 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "Verified layout: "
             f"{len(layout['initializer_pairs'])} BT.709/sRGB initializers, "
+            f"hook RVA 0x{layout['hook_rva']:X}, cave RVA 0x{layout['cave_rva']:X}"
+        )
+    elif "hook_rva" in layout:
+        print(
+            "Verified layout: "
+            f"{len(layout['initializer_rvas'])} BT.709/sRGB initializers, "
             f"hook RVA 0x{layout['hook_rva']:X}, cave RVA 0x{layout['cave_rva']:X}"
         )
     else:

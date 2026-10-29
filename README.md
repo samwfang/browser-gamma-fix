@@ -1,5 +1,31 @@
 # Browser Gamma Fix
 
+> **Fork note — updated for VS Code, Discord and Claude.**
+> This fork of [mrsaliericz/browser-gamma-fix](https://github.com/mrsaliericz/browser-gamma-fix)
+> (v0.8.0) adds the same gamma 2.2 correction to three Electron desktop apps:
+> **Visual Studio Code**, **Discord** and the **Claude** desktop app. Without
+> it, these apps can shift brightness while Windows HDR (and `dwm_eotf_rs`) is
+> on.
+>
+> - Electron links Chromium into the app's own EXE. Its sRGB setup matches
+>   the Edge layout (52 constructors), while its HDR output path matches
+>   Chrome's hook. The new Electron analyzer reuses both strict checks and
+>   still refuses any layout it does not recognize.
+> - Verified on VS Code (Chromium 150), Claude 4.29 and Discord 1.0.9266
+>   (Chromium 152). The tray finds VS Code's standard install paths, Discord's
+>   newest `app-*` folder, and Claude's MSIX package folder, and follows their
+>   updates.
+> - Node helper processes started from the same EXE are skipped. Only the main
+>   and GPU processes are patched, in memory only, exactly as for browsers.
+> - The download links below point to the **original** releases, which do not
+>   include this support. Build this fork from source (see
+>   [Technical details](docs/TECHNICAL_DETAILS.md#build-from-source)). The
+>   tray's built-in updater also offers original releases, and installing one
+>   removes the Electron support.
+>
+> All credit for Browser Gamma Fix goes to its author, Jaroslav Safar. This
+> fork keeps the original MIT license.
+
 **Browser Gamma Fix makes ordinary SDR web content look correct in Windows HDR.**
 
 When Windows HDR is on, Chromium-based browsers can make SDR shadows look too

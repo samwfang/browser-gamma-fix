@@ -388,6 +388,17 @@ def discover_chrome_runtime_layout(path: Path) -> dict:
             f"group, found {len(candidates)}"
         )
 
+    result = candidates[0]
+    result.update(discover_chrome_output_layout(text, text_rva))
+    return result
+
+
+def discover_chrome_output_layout(text: bytes, text_rva: int) -> dict:
+    """Discover the Chrome ScreenWin SDR output hook and its code cave.
+
+    Shared by Chrome and Electron apps, whose embedded Chromium uses the same
+    output path even when its sRGB initializers follow the Edge layout.
+    """
     hook_rva, helper_rva = find_chrome_hdr_output_hook_in_text(text, text_rva)
     resume_rva = hook_rva + len(HDR_OUTPUT_HOOK_ORIGINAL)
     call_offset = resume_rva - text_rva
@@ -421,18 +432,14 @@ def discover_chrome_runtime_layout(path: Path) -> dict:
         )
     cave_rva = text_rva + cave_positions[0] + 1
 
-    result = candidates[0]
-    result.update(
-        {
-            "hook_rva": hook_rva,
-            "hook_original": HDR_OUTPUT_HOOK_ORIGINAL,
-            "resume_rva": resume_rva,
-            "set_output_call_rva": helper_rva,
-            "cave_rva": cave_rva,
-            "cave_size": 96,
-        }
-    )
-    return result
+    return {
+        "hook_rva": hook_rva,
+        "hook_original": HDR_OUTPUT_HOOK_ORIGINAL,
+        "resume_rva": resume_rva,
+        "set_output_call_rva": helper_rva,
+        "cave_rva": cave_rva,
+        "cave_size": 96,
+    }
 
 
 def find_initializer_loads(
